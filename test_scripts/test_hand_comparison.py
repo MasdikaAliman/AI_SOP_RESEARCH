@@ -144,9 +144,28 @@ def draw_status(frame, text: str, color, y=100):
     cv2.putText(frame, text, (14, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
 
+def is_hand_grip_from_lms(lms, threshold=0.25):
+    pts = []
+    for lm in lms.landmark:
+        pts.append([lm.x, lm.y])
+    pts = np.array(pts)
+
+    # palm center
+    center = (pts[0] + pts[5] + pts[17]) / 3
+
+    tip_ids = [4, 8, 12, 16, 20]
+
+    close_count = 0
+
+    for tip in tip_ids:
+        dist = np.linalg.norm(pts[tip] - center)
+        if dist < threshold:
+            close_count += 1
+
+    return close_count >= 3
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-
 def process_reference_hand_pose(file_path_name,handspose):
     image_referece = cv2.imread(file_path_name)
     rgb_frame=cv2.cvtColor(image_referece, cv2.COLOR_BGR2RGB)
@@ -188,7 +207,7 @@ def main():
     prev_t = time.time()
     sim_score = 0.0
 
-    reference_embedding = process_reference_hand_pose("../image_test/SOP/capture.png", hands_pose)
+    reference_embedding = process_reference_hand_pose("../image_test/SOP/STEP_2.png", hands_pose)
 
     ic(reference_embedding.shape)
 
@@ -216,7 +235,7 @@ def main():
         hand_data = []
         hand_in_area = False
         live_embedding = None
-
+        is_grip = False
         if results_handpose.multi_hand_landmarks and results_handpose.multi_handedness:
             for lms, handedness in zip(results_handpose.multi_hand_landmarks,
                                        results_handpose.multi_handedness):
@@ -237,6 +256,14 @@ def main():
                 )
                 draw_landmark_ids(visual_frame, lms, w, h)
 
+
+                is_grip = is_hand_grip_from_lms(lms)
+
+                if is_grip:
+                    draw_status(visual_frame, "GRIP ✊", CLR_GREEN, y=140)
+                else:
+                    draw_status(visual_frame, "OPEN ✋", CLR_YELLOW, y=140)
+
                 # Highlight fingertips
                 for tip_id in FINGER_TIPS:
                     lm = lms.landmark[tip_id]
@@ -252,7 +279,7 @@ def main():
             sim_score = cosine_similarity(reference_embedding, live_embedding)
             draw_sim_bar(visual_frame, sim_score)
 
-            if sim_score >= SIMILARITY_THRESHOLD and hand_in_area:
+            if (is_grip or sim_score >= SIMILARITY_THRESHOLD) and hand_in_area :
                 draw_status(visual_frame, "MATCH", CLR_GREEN, y=100)
             else:
                 draw_status(visual_frame, "NO MATCH", CLR_RED, y=100)
@@ -283,7 +310,7 @@ def main():
 
         if key == ord('s'):
             print("Save Pict")
-            cv2.imwrite("capture.png", frame.copy())
+            cv2.imwrite("_.png", frame.copy())
 
         # ── R: capture reference ───────────────────────────────────────────
         if key == ord('r'):

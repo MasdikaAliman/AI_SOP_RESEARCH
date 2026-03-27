@@ -1,669 +1,491 @@
 """
-assembly_monitor.py
-===================
-Real-time assembly step validator using MediaPipe Hands + OpenCV.
+sop_zone_main.py
+────────────────────────────────────────────────────────────────────────────
+SOP Assembly Verifier
+  - MediaPipe Hands  →  zone detection + grip detection (dari test_hand_comparison)
+  - DINOv2           →  scene similarity vs SOP reference image (dari main.py)
 
-3-step demo scaffold:
-  Step 0 — Pick up Component A  (Item Zone A → Assembly Zone → pose match)
-  Step 1 — Pick up Component B  (Item Zone B → Assembly Zone → pose match)
-  Step 2 — Final assembly pose  (Assembly Zone only → pose match)
+Alur per step:
+  1. Tangan masuk ZONE PICK + grip terdeteksi  →  status "PICKED"
+  2. Tangan masuk ZONE CHECK (setelah picked)   →  ambil frame, kirim ke DINOv2
+  3. Similarity >= threshold                    →  PASS → lanjut step berikutnya
+  4. Similarity <  threshold                    →  FAIL → operator ulangi
 
-Hotkeys (during runtime):
-  R  — capture reference pose for the CURRENT step
-  N  — force-advance to next step (debug)
-  Q  — quit
+Urutan step DILOCK — step N hanya aktif setelah step N-1 PASS.
 
-Zone setup:
-  • Pre-configure bboxes in ZONE_CONFIG below.
-  • If a zone bbox is None, the program pauses on first launch and asks
-    you to drag the zone with the mouse.
-
-Dependencies:
-    pip install opencv-python mediapipe numpy scipy
+Hotkeys:
+  Q / ESC  → quit
+  S        → simpan snapshot
+  R        → reset ke step 1
+────────────────────────────────────────────────────────────────────────────
 """
 
 import cv2
 import mediapipe as mp
 import numpy as np
-from scipy.spatial import procrustes as scipy_procrustes
-from enum import Enum, auto
-from typing import Optional
 import time
+from icecream import ic
+
+from DINOv2Encoder import DINOv2Encoder
+from SOPReferenceBank import SOPReferenceBank
+from SOPVerifier import SOPVerifier
+
+# ── MediaPipe ─────────────────────────────────────────────────────────────────
+mp_hands   = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+# ── Landmark groups ───────────────────────────────────────────────────────────
+FINGER_TIPS   = [4, 8, 12, 16, 20]
+THUMB_FINGER  = [2, 3, 4]
+INDEX_FINGER  = [5, 6, 7, 8]
+MIDDLE_FINGER = [9, 10, 11, 12]
+
+# ── Colours (BGR) ─────────────────────────────────────────────────────────────
+CLR_WHITE  = (240, 240, 240)
+CLR_GREEN  = (50,  220,  90)
+CLR_RED    = (60,   60, 220)
+CLR_YELLOW = (30,  220, 200)
+CLR_ACCENT = (0,   210, 255)
+CLR_ORANGE = (0,   140, 255)
+CLR_GRAY   = (120, 120, 120)
+CLR_PURPLE = (200,  80, 200)
+
+# ── Tuning ────────────────────────────────────────────────────────────────────
+GRIP_THRESHOLD  = 0.25   # normalized dist finger-tip → palm center
+DWELL_CHECK_SEC = 0.6    # detik tangan harus di zone check sebelum trigger verify
+SIM_THRESHOLD   = 0.80   # cosine similarity DINOv2 untuk PASS
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+#  SOP STEP CONFIG  —  sesuaikan zone dan path gambar kamu di sini
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Bounding boxes: (x1, y1, x2, y2) in pixel coords, or None to draw with mouse.
-ZONE_CONFIG = {
-    "item_a":   None,   # e.g. (30,  280, 180, 460)
-    "item_b":   None,   # e.g. (460, 280, 620, 460)
-    "assembly": None,   # e.g. (190, 120, 450, 380)
-}
-
-# 3-step demo
-STEPS = [
+SOP_STEPS = [
     {
-        "name":          "Pick up Component A",
-        "item_zone":     "item_a",    # hand must visit this zone first
-        "assembly_zone": "assembly",  # then enter here before pose check
-        "ref_embedding": None,        # filled at runtime via R key
+        "step_id"     : 0,
+        "name"        : "STEP 1",
+        "instruction" : "Ambil item dari area MERAH, pasang di area KUNING",
+        "zone_pick"   : (246,  2, 453, 186),   # area ambil item
+        "zone_check"  : (149, 163, 298, 368),   # area pasang / verifikasi
+        "clr_pick"    : CLR_RED,
+        "clr_check"   : CLR_YELLOW,
     },
     {
-        "name":          "Pick up Component B",
-        "item_zone":     "item_b",
-        "assembly_zone": "assembly",
-        "ref_embedding": None,
+        "step_id"     : 1,
+        "name"        : "STEP 2",
+        "instruction" : "Ambil item dari area ORANGE, pasang di area HIJAU",
+        "zone_pick"   : (365, 162, 494, 356),
+        "zone_check"  : (50,  280, 230, 460),
+        "clr_pick"    : CLR_ORANGE,
+        "clr_check"   : CLR_GREEN,
     },
     {
-        "name":          "Final assembly pose",
-        "item_zone":     None,        # no pickup zone for last step
-        "assembly_zone": "assembly",
-        "ref_embedding": None,
+        "step_id"     : 2,
+        "name"        : "STEP 3",
+        "instruction" : "Ambil item dari area UNGU, pasang di area CYAN",
+        "zone_pick"   : (440, 10, 630, 180),
+        "zone_check"  : (50,  10, 230, 180),
+        "clr_pick"    : CLR_PURPLE,
+        "clr_check"   : CLR_ACCENT,
     },
 ]
 
-# ---------- Tuning knobs ----------
-SIMILARITY_THRESHOLD = 0.92   # cosine sim gate  [0..1], higher = stricter
-HOLD_FRAMES          = 15     # frames pose must stay matched to confirm step
-CAMERA_INDEX         = 0      # webcam device index
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HAND HELPERS  (dari test_hand_comparison, tidak diubah)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_hand_data(lms, label: str) -> dict:
+    wrist      = (lms.landmark[0].x, lms.landmark[0].y)
+    thumb_data = [[lms.landmark[i].x, lms.landmark[i].y] for i in THUMB_FINGER]
+    index_data = [[lms.landmark[i].x, lms.landmark[i].y] for i in INDEX_FINGER]
+    mid_data   = [[lms.landmark[i].x, lms.landmark[i].y] for i in MIDDLE_FINGER]
+    return {"label": label, "wrist": wrist,
+            "thumb_point": thumb_data, "index_point": index_data, "mid_point": mid_data}
 
 
-# ---------------------------------------------------------------------------
-# State machine states
-# ---------------------------------------------------------------------------
-
-class State(Enum):
-    IDLE             = auto()
-    IN_ITEM_ZONE     = auto()
-    IN_ASSEMBLY_ZONE = auto()
-    POSE_MATCH       = auto()
-    STEP_COMPLETE    = auto()
+def parse_to_array(hand: dict) -> np.ndarray:
+    pts = []
+    wx, wy = hand["wrist"]
+    pts.append([wx, wy])
+    for x, y in hand["thumb_point"]:  pts.append([x, y])
+    for x, y in hand["index_point"]:  pts.append([x, y])
+    for x, y in hand["mid_point"]:    pts.append([x, y])
+    return np.array(pts, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# PoseEstimator
-# ---------------------------------------------------------------------------
-
-class PoseEstimator:
-    """
-    Wraps MediaPipe Hands.
-    Extracts 21 landmarks and normalises them to a scale-invariant vector.
-
-    Normalisation math
-    ------------------
-    Given raw landmarks L = [(x0,y0), ..., (x20,y20)] in image coordinates:
-
-    1. Translate:  L' = L - L[0]          (wrist moves to origin)
-    2. Scale:      L'' = L' / max_dist     where max_dist = max |L'[i]|
-    3. Flatten:    v = L''.flatten()       → 42-D vector
-
-    This ensures the vector encodes *hand shape only*, independent of:
-    - Distance from camera  (scale invariant)
-    - Position in frame     (translation invariant)
-
-    Cosine similarity on these vectors then measures how close two hand
-    *shapes* are in 42-D angular space.
-    """
-
-    def __init__(self, max_hands: int = 1, min_detect_conf: float = 0.7):
-        self.mp_hands = mp.solutions.hands
-        self.mp_draw  = mp.solutions.drawing_utils
-        self.hands    = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=max_hands,
-            min_detection_confidence=min_detect_conf,
-            min_tracking_confidence=0.6,
-        )
-        self.results = None
-
-    def process(self, frame_rgb: np.ndarray):
-        """Run MediaPipe on an RGB frame. Stores results internally."""
-        self.results = self.hands.process(frame_rgb)
-
-    def get_landmarks_px(self, frame_shape) -> Optional[np.ndarray]:
-        """
-        Returns (21, 2) float32 pixel array for the first detected hand,
-        or None if no hand found.
-        """
-        if not self.results or not self.results.multi_hand_landmarks:
-            return None
-        h, w = frame_shape[:2]
-        lm = self.results.multi_hand_landmarks[0].landmark
-        return np.array([[p.x * w, p.y * h] for p in lm], dtype=np.float32)
-
-    def normalize(self, landmarks_px: np.ndarray) -> np.ndarray:
-        """
-        Normalise (21, 2) landmark array → scale-invariant 42-D vector.
-        """
-        pts = landmarks_px.copy()
-        pts -= pts[0]                                    # 1. translate to wrist
-        max_dist = np.max(np.linalg.norm(pts, axis=1))
-        if max_dist > 1e-6:
-            pts /= max_dist                              # 2. unit scale
-        return pts.flatten()                             # 3. flatten
-
-    def draw_landmarks(self, frame_bgr: np.ndarray):
-        """Draw MediaPipe landmark overlay on a BGR frame in-place."""
-        if self.results and self.results.multi_hand_landmarks:
-            for hand_lm in self.results.multi_hand_landmarks:
-                self.mp_draw.draw_landmarks(
-                    frame_bgr,
-                    hand_lm,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_draw.DrawingSpec(color=(0, 200, 255), thickness=2, circle_radius=3),
-                    self.mp_draw.DrawingSpec(color=(0, 120, 200), thickness=2),
-                )
-
-    def get_hand_center_px(self, frame_shape) -> Optional[tuple]:
-        """Returns (cx, cy) centroid of the detected hand, or None."""
-        pts = self.get_landmarks_px(frame_shape)
-        if pts is None:
-            return None
-        return (int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1])))
-
-    def close(self):
-        self.hands.close()
+def embed(hand: dict) -> np.ndarray:
+    pts    = parse_to_array(hand)
+    center = (pts[5] + pts[9]) / 2
+    pts   -= center
+    scale  = np.linalg.norm(pts[5] - pts[9])
+    if scale > 1e-6:
+        pts /= scale
+    base       = pts.flatten()
+    thumb_tip  = pts[3];  index_tip = pts[7];  middle_tip = pts[11]
+    d1 = np.linalg.norm(thumb_tip  - index_tip)
+    d2 = np.linalg.norm(index_tip  - middle_tip)
+    d3 = np.linalg.norm(thumb_tip  - middle_tip)
+    return np.concatenate([base, np.array([d1, d2, d3])])
 
 
-# ---------------------------------------------------------------------------
-# ZoneManager
-# ---------------------------------------------------------------------------
-
-class Zone:
-    __slots__ = ("name", "bbox", "color")
-    def __init__(self, name, bbox, color):
-        self.name  = name
-        self.bbox  = bbox    # (x1, y1, x2, y2)
-        self.color = color   # BGR
+def is_grip(lms, threshold=GRIP_THRESHOLD) -> bool:
+    pts    = np.array([[lm.x, lm.y] for lm in lms.landmark])
+    center = (pts[0] + pts[5] + pts[17]) / 3
+    return sum(np.linalg.norm(pts[t] - center) < threshold
+               for t in [4, 8, 12, 16, 20]) >= 3
 
 
-class ZoneManager:
-    """
-    Manages named rectangular zones.
-    Supports runtime mouse-draw for zones not pre-configured.
-    """
+def wrist_pixel(lms, w, h):
+    lm = lms.landmark[0]
+    return int(lm.x * w), int(lm.y * h)
 
-    COLORS = {
-        "item_a":   (30,  200, 255),   # yellow
-        "item_b":   (255, 140,  30),   # blue-orange
-        "assembly": (80,  255, 120),   # green
+
+def fingertip_pixels(lms, w, h):
+    return [(int(lms.landmark[t].x * w), int(lms.landmark[t].y * h))
+            for t in FINGER_TIPS]
+
+
+def point_in_zone(px, py, zone) -> bool:
+    x1, y1, x2, y2 = zone
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
+def any_tip_in_zone(tips, zone) -> bool:
+    return any(point_in_zone(cx, cy, zone) for cx, cy in tips)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DRAWING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def draw_zone(frame, zone, color, label, active=False):
+    x1, y1, x2, y2 = zone
+    thickness = 3 if active else 1
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+    # semi-transparent fill when active
+    if active:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+    cv2.putText(frame, label, (x1 + 4, y1 + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+
+def draw_label(frame, text, color, x=14, y=100):
+    tw = len(text) * 9 + 8
+    cv2.rectangle(frame, (x - 2, y - 18), (x + tw, y + 6), (15, 15, 25), -1)
+    cv2.putText(frame, text, (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+
+def draw_sim_bar(frame, sim, x=14, y=60, bw=200, bh=14):
+    filled = int(bw * max(0.0, sim))
+    color  = CLR_GREEN if sim >= SIM_THRESHOLD else CLR_ACCENT
+    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (50, 50, 50), -1)
+    cv2.rectangle(frame, (x, y), (x + filled, y + bh), color, -1)
+    cv2.putText(frame, f"sim: {sim:.3f}", (x + bw + 8, y + 11),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+
+def draw_step_progress(frame, steps, current_step, w):
+    """Top-right mini progress panel."""
+    panel_x = w - 220
+    for i, step in enumerate(steps):
+        y = 20 + i * 28
+        if i < current_step:
+            color, symbol = CLR_GREEN,  "DONE"
+        elif i == current_step:
+            color, symbol = CLR_YELLOW, "NOW >"
+        else:
+            color, symbol = CLR_GRAY,   "LOCK"
+        cv2.putText(frame, f"{step['name']} [{symbol}]", (panel_x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+
+def draw_dwell_bar(frame, elapsed, total, x=14, y=170, bw=200, bh=10):
+    """Progress bar untuk dwell timer."""
+    ratio  = min(elapsed / total, 1.0)
+    filled = int(bw * ratio)
+    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (50, 50, 50), -1)
+    cv2.rectangle(frame, (x, y), (x + filled, y + bh), CLR_ACCENT, -1)
+    cv2.putText(frame, "dwell...", (x + bw + 8, y + 9),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, CLR_ACCENT, 1, cv2.LINE_AA)
+
+
+def flash_result(frame, passed: bool, message: str):
+    color   = CLR_GREEN if passed else CLR_RED
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 70), color, -1)
+    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+    cv2.putText(frame, message[:55], (10, 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, CLR_WHITE, 2, cv2.LINE_AA)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PER-STEP RUNTIME STATE  (simple dict, no state machine class)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_step_runtime():
+    return {
+        "picked"       : False,   # True setelah grip di zone pick terkonfirmasi
+        "check_entered": False,   # True saat tangan pertama kali masuk zone check
+        "dwell_start"  : None,    # timestamp saat dwell di zone check dimulai
+        "last_sim"     : 0.0,
+        "passed"       : False,
     }
 
-    def __init__(self):
-        self.zones: dict[str, Zone] = {}
-        self._drawing    = False
-        self._draw_start = None
-        self._cur_rect   = None
 
-    def add_zone(self, name: str, bbox: tuple):
-        color = self.COLORS.get(name, (200, 200, 200))
-        self.zones[name] = Zone(name, bbox, color)
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def point_in_zone(self, name: str, pt: tuple) -> bool:
-        if name not in self.zones:
-            return False
-        x1, y1, x2, y2 = self.zones[name].bbox
-        px, py = pt
-        return x1 <= px <= x2 and y1 <= py <= y2
+def main():
+    # ── Init DINOv2 + reference bank ─────────────────────────────────────────
+    print("[INFO] Loading DINOv2 encoder...")
+    encoder = DINOv2Encoder(model_name="dinov2_vitb14")
 
-    def draw_zones(self, frame: np.ndarray):
-        """Semi-transparent zone rectangles drawn on frame in-place."""
-        overlay = frame.copy()
-        for z in self.zones.values():
-            x1, y1, x2, y2 = z.bbox
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), z.color, -1)
-        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
-        for z in self.zones.values():
-            x1, y1, x2, y2 = z.bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), z.color, 2)
-            cv2.putText(frame, z.name, (x1 + 6, y1 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, z.color, 1, cv2.LINE_AA)
+    bank = SOPReferenceBank(encoder)
+    # Ganti ke bank.load() kalau sudah pernah save
+    bank.register_from_folder("image_test/SOP")
+    bank.save("image_test/SOP")
 
-    # ------------------------------------------------------------------
-    # Mouse-draw fallback
-    # ------------------------------------------------------------------
+    verifier = SOPVerifier(encoder=encoder, bank=bank,
+                           pass_threshold=SIM_THRESHOLD)
 
-    def draw_zone_interactively(self, zone_name: str, frame: np.ndarray,
-                                 win_name: str) -> tuple:
-        """
-        Block until user drags a rectangle for zone_name.
-        Returns chosen (x1, y1, x2, y2) bbox.
-        """
-        result     = [None]
-        start      = [None]
-        cur_rect   = [None]
+    # ── Init MediaPipe ────────────────────────────────────────────────────────
+    hands_model = mp_hands.Hands(
+        model_complexity=1,
+        max_num_hands=2,
+        min_detection_confidence=0.55,
+        min_tracking_confidence=0.50,
+    )
+    conn_style = mp_drawing.DrawingSpec(color=CLR_ACCENT, thickness=2)
+    lm_style   = mp_drawing.DrawingSpec(color=CLR_GREEN,  thickness=4, circle_radius=4)
 
-        def mouse_cb(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                start[0] = (x, y)
-            elif event == cv2.EVENT_MOUSEMOVE and start[0]:
-                cur_rect[0] = (*start[0], x, y)
-            elif event == cv2.EVENT_LBUTTONUP and start[0]:
-                x1 = min(start[0][0], x)
-                y1 = min(start[0][1], y)
-                x2 = max(start[0][0], x)
-                y2 = max(start[0][1], y)
-                result[0] = (x1, y1, x2, y2)
-                start[0] = None
+    # ── Camera ────────────────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
-        cv2.setMouseCallback(win_name, mouse_cb)
+    # ── Runtime per step ──────────────────────────────────────────────────────
+    runtimes     = [make_step_runtime() for _ in SOP_STEPS]
+    current_step = 0          # index step yang aktif sekarang
+    all_done     = False
 
-        while result[0] is None:
-            disp = frame.copy()
-            _draw_instruction(disp, f"Draw zone '{zone_name}': click and drag, then release")
-            if cur_rect[0]:
-                x1, y1, x2, y2 = cur_rect[0]
-                cv2.rectangle(disp, (x1, y1), (x2, y2),
-                              self.COLORS.get(zone_name, (255, 255, 0)), 2)
-            cv2.imshow(win_name, disp)
-            k = cv2.waitKey(20) & 0xFF
-            if k == ord('q'):
-                raise SystemExit("Quit during zone setup.")
+    fps      = 0.0
+    prev_t   = time.time()
+    last_sim = 0.0
 
-        cv2.setMouseCallback(win_name, lambda *a: None)
-        return result[0]
+    print("\nHotkeys: Q/ESC = quit   S = snapshot   R = reset")
+    print(f"Starting at {SOP_STEPS[0]['name']}: {SOP_STEPS[0]['instruction']}\n")
 
-
-# ---------------------------------------------------------------------------
-# EmbeddingMatcher
-# ---------------------------------------------------------------------------
-
-class EmbeddingMatcher:
-    """
-    Stores one reference embedding per step and scores real-time vectors.
-
-    Cosine similarity (default, fast)
-    ----------------------------------
-    Because PoseEstimator.normalize() produces a unit-scale vector (not
-    unit-norm), we L2-normalise once more here so:
-        cosine_sim(A, B) = dot(A_unit, B_unit)
-    which collapses to a cheap NumPy dot product.
-
-    Range: [-1, 1]; for valid hand poses you'll see [0.7, 1.0].
-    Threshold 0.92 ≈ angular distance of ~23° in 42-D space.
-
-    Procrustes similarity (optional)
-    ---------------------------------
-    scipy procrustes aligns two (21,2) point clouds by optimal rotation +
-    uniform scale, then returns a residual disparity score ∈ [0, 1].
-    Lower disparity = better match. We convert to similarity via:
-        sim = max(0,  1 - disparity * 10)
-    (the *10 factor empirically maps the ~0.0–0.1 range to 0–1).
-    Useful when the hand may be rotated between capture and use.
-    Slower (~0.5 ms) than cosine (~0.05 ms), so only use when needed.
-    """
-
-    def __init__(self):
-        self.reference_vec: Optional[np.ndarray] = None  # unit 42-D
-        self.reference_2d:  Optional[np.ndarray] = None  # (21,2) for Procrustes
-
-    def set_reference(self, vector: np.ndarray,
-                      landmarks_2d: Optional[np.ndarray] = None):
-        norm = np.linalg.norm(vector)
-        self.reference_vec = vector / norm if norm > 1e-9 else vector.copy()
-        self.reference_2d  = landmarks_2d.copy() if landmarks_2d is not None else None
-
-    @property
-    def has_reference(self) -> bool:
-        return self.reference_vec is not None
-
-    def cosine_similarity(self, vector: np.ndarray) -> float:
-        """Fast cosine sim. Returns 0.0 if no reference set."""
-        if not self.has_reference:
-            return 0.0
-        norm = np.linalg.norm(vector)
-        if norm < 1e-9:
-            return 0.0
-        return float(np.dot(self.reference_vec, vector / norm))
-
-    def procrustes_similarity(self, landmarks_2d: np.ndarray) -> float:
-        """Rotation-invariant Procrustes sim. Returns 0.0 if no reference."""
-        if self.reference_2d is None:
-            return 0.0
-        try:
-            _, _, disp = scipy_procrustes(self.reference_2d, landmarks_2d)
-            return float(max(0.0, 1.0 - disp * 10))
-        except Exception:
-            return 0.0
-
-
-# ---------------------------------------------------------------------------
-# AssemblyMonitor  (orchestrator)
-# ---------------------------------------------------------------------------
-
-class AssemblyMonitor:
-    """
-    Orchestrates PoseEstimator, ZoneManager, EmbeddingMatcher instances,
-    and drives a per-step state machine.
-
-    State flow per step
-    -------------------
-    IDLE
-     ↓  hand detected & enters item_zone  (or skipped if item_zone=None)
-    IN_ITEM_ZONE
-     ↓  hand moves into assembly_zone
-    IN_ASSEMBLY_ZONE
-     ↓  cosine_sim ≥ SIMILARITY_THRESHOLD  (and reference exists)
-    POSE_MATCH
-     ↓  hold for HOLD_FRAMES consecutive frames
-    STEP_COMPLETE  →  auto-advance to next step
-    """
-
-    WIN = "Assembly Monitor"
-
-    def __init__(self):
-        self.pose  = PoseEstimator()
-        self.zones = ZoneManager()
-        self.matchers = [EmbeddingMatcher() for _ in STEPS]
-        self.steps = STEPS
-
-        self.current_step = 0
-        self.state        = State.IDLE
-        self.hold_count   = 0
-        self.sim_score    = 0.0
-        self.all_done     = False
-
-        self._last_lm_px: Optional[np.ndarray] = None  # most recent landmarks
-
-    # ------------------------------------------------------------------
-    # Zone setup
-    # ------------------------------------------------------------------
-
-    def _setup_zones(self, cap):
-        """Load pre-configured zones; interactively draw any that are None."""
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            raise RuntimeError("Cannot read camera frame during zone setup.")
-        frame = cv2.flip(frame, 1)
+            print("[ERR] Frame grab failed")
+            break
 
-        for name, bbox in ZONE_CONFIG.items():
-            if bbox is not None:
-                self.zones.add_zone(name, bbox)
+        frame        = cv2.flip(frame, 1)
+        display      = frame.copy()
+        h, w         = display.shape[:2]
+        rgb          = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_result    = hands_model.process(rgb)
+
+        step_cfg     = SOP_STEPS[current_step]
+        rt           = runtimes[current_step]
+        zone_pick    = step_cfg["zone_pick"]
+        zone_check   = step_cfg["zone_check"]
+
+        # ── Draw all zones ────────────────────────────────────────────────────
+        for i, s in enumerate(SOP_STEPS):
+            alpha = 1.0 if i == current_step else 0.4
+            # dim inactive zones by drawing with gray
+            zc_pick  = s["clr_pick"]  if i == current_step else CLR_GRAY
+            zc_check = s["clr_check"] if i == current_step else CLR_GRAY
+            label_pick  = f"PICK S{i+1}"  if i >= current_step else f"S{i+1} DONE"
+            label_check = f"CHECK S{i+1}" if i >= current_step else f"S{i+1} DONE"
+            draw_zone(display, s["zone_pick"],  zc_pick,  label_pick,
+                      active=(i == current_step and not rt["picked"]))
+            draw_zone(display, s["zone_check"], zc_check, label_check,
+                      active=(i == current_step and rt["picked"]))
+
+        # ── Progress panel ────────────────────────────────────────────────────
+        draw_step_progress(display, SOP_STEPS, current_step, w)
+
+        # ── Per-frame hand variables ──────────────────────────────────────────
+        hand_in_pick  = False
+        hand_in_check = False
+        grip_detected = False
+        live_embedding= None
+
+        if mp_result.multi_hand_landmarks and mp_result.multi_handedness:
+            for lms, handedness in zip(mp_result.multi_hand_landmarks,
+                                       mp_result.multi_handedness):
+                label = handedness.classification[0].label
+
+                # Draw skeleton
+                mp_drawing.draw_landmarks(display, lms, mp_hands.HAND_CONNECTIONS,
+                                          lm_style, conn_style)
+
+                # Fingertip pixels
+                tips = fingertip_pixels(lms, w, h)
+                for cx, cy in tips:
+                    cv2.circle(display, (cx, cy), 9, CLR_YELLOW, -1)
+                    cv2.circle(display, (cx, cy), 9, CLR_WHITE,  2)
+
+                # Wrist pixel (for zone check — more stable than fingertip)
+                wx_px, wy_px = wrist_pixel(lms, w, h)
+
+                # Zone membership
+                if any_tip_in_zone(tips, zone_pick):
+                    hand_in_pick = True
+                # Use wrist OR any tip for check zone
+                if (point_in_zone(wx_px, wy_px, zone_check) or
+                        any_tip_in_zone(tips, zone_check)):
+                    hand_in_check = True
+
+                # Grip
+                if is_grip(lms):
+                    grip_detected = True
+
+                # Embedding (first hand only)
+                if live_embedding is None:
+                    hand_data     = extract_hand_data(lms, label)
+                    live_embedding = embed(hand_data)
+
+        # ── Grip status label ─────────────────────────────────────────────────
+        if mp_result.multi_hand_landmarks:
+            grip_text  = "GRIP" if grip_detected else "OPEN"
+            grip_color = CLR_GREEN if grip_detected else CLR_YELLOW
+            draw_label(display, grip_text, grip_color, x=14, y=140)
+
+        # ══════════════════════════════════════════════════════════════════════
+        #  PICK LOGIC
+        #  Tangan di zone pick + grip → set picked = True
+        # ══════════════════════════════════════════════════════════════════════
+        if not all_done and not rt["picked"]:
+            if hand_in_pick and grip_detected:
+                rt["picked"] = True
+                print(f"[PICK] {step_cfg['name']} — item picked")
+
+        # ══════════════════════════════════════════════════════════════════════
+        #  CHECK LOGIC
+        #  Setelah picked: tangan masuk zone check → dwell → trigger DINOv2
+        # ══════════════════════════════════════════════════════════════════════
+        if not all_done and rt["picked"] and not rt["passed"]:
+
+            if hand_in_check:
+                # Start dwell timer
+                if rt["dwell_start"] is None:
+                    rt["dwell_start"] = time.time()
+                    rt["check_entered"] = True
+                    print(f"[CHECK] {step_cfg['name']} — hand in check zone, dwelling...")
+
+                elapsed = time.time() - rt["dwell_start"]
+                draw_dwell_bar(display, elapsed, DWELL_CHECK_SEC)
+
+                # Dwell complete → trigger DINOv2 verify
+                if elapsed >= DWELL_CHECK_SEC:
+                    print(f"[VERIFY] Running DINOv2 for {step_cfg['name']}...")
+                    verifier.jump_to_step(current_step)
+                    result = verifier.verify(frame)
+                    last_sim = result["similarity"]
+
+                    flash_result(display, result["passed"], result["message"])
+                    cv2.imshow("SOP Assembly", display)
+                    cv2.waitKey(1200)
+
+                    print(f"  → {result['message']}  sim={result['similarity']}")
+
+                    if result["passed"]:
+                        rt["passed"] = True
+                        rt["last_sim"] = last_sim
+
+                        # Advance ke step berikutnya
+                        if current_step < len(SOP_STEPS) - 1:
+                            current_step += 1
+                            verifier.jump_to_step(current_step)
+                            print(f"\n[NEXT] Proceeding to {SOP_STEPS[current_step]['name']}")
+                            print(f"       {SOP_STEPS[current_step]['instruction']}")
+                        else:
+                            all_done = True
+                            print("\n[DONE] All SOP steps completed!")
+                    else:
+                        # Reset dwell agar bisa coba lagi
+                        rt["dwell_start"] = None
+                        rt["picked"]      = False   # harus pick ulang
+                        print(f"  → Retry: ambil item dan pasang kembali")
+
             else:
-                # Draw already-confirmed zones so user has context
-                self.zones.draw_zones(frame)
-                drawn = self.zones.draw_zone_interactively(name, frame, self.WIN)
-                self.zones.add_zone(name, drawn)
-                # Refresh frame for next zone
-                ret, frame = cap.read()
-                if ret:
-                    frame = cv2.flip(frame, 1)
+                # Tangan keluar zone check → reset dwell
+                if rt["dwell_start"] is not None:
+                    rt["dwell_start"] = None
 
-        print("[INFO] All zones configured:")
-        for n, z in self.zones.zones.items():
-            print(f"        {n}: {z.bbox}")
+        # ══════════════════════════════════════════════════════════════════════
+        #  ALL DONE overlay
+        # ══════════════════════════════════════════════════════════════════════
+        if all_done:
+            overlay = display.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 180, 60), -1)
+            cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
+            cv2.putText(display, "ALL STEPS COMPLETE!", (60, h // 2 - 10),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.1, CLR_WHITE, 2, cv2.LINE_AA)
+            cv2.putText(display, "Press R to reset", (160, h // 2 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, CLR_YELLOW, 1, cv2.LINE_AA)
 
-    # ------------------------------------------------------------------
-    # Reference capture (R key)
-    # ------------------------------------------------------------------
+        # ── HUD ───────────────────────────────────────────────────────────────
+        # Instruction bar
+        inst_text = "ALL DONE — press R to reset" if all_done else step_cfg["instruction"]
+        cv2.rectangle(display, (0, h - 30), (w, h), (15, 15, 25), -1)
+        cv2.putText(display, inst_text, (8, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, CLR_WHITE, 1, cv2.LINE_AA)
 
-    def capture_reference(self):
-        """Save current hand pose as reference for the current step."""
-        if self._last_lm_px is None:
-            print("[WARN] No hand in frame — cannot capture reference.")
-            return
-        vec = self.pose.normalize(self._last_lm_px)
-        self.matchers[self.current_step].set_reference(vec, self._last_lm_px)
-        print(f"[INFO] Reference captured — step {self.current_step}: "
-              f"'{self.steps[self.current_step]['name']}'")
+        # Sim bar (last known)
+        draw_sim_bar(display, last_sim)
 
-    # ------------------------------------------------------------------
-    # State machine
-    # ------------------------------------------------------------------
-
-    def _tick(self, hand_center: Optional[tuple],
-               norm_vector: Optional[np.ndarray]):
-        """One state-machine tick per frame."""
-        if self.all_done:
-            return
-
-        step    = self.steps[self.current_step]
-        matcher = self.matchers[self.current_step]
-
-        if hand_center is None:
-            if self.state not in (State.STEP_COMPLETE,):
-                self.state      = State.IDLE
-                self.hold_count = 0
-                self.sim_score  = 0.0
-            return
-
-        item_zone = step.get("item_zone")
-        asm_zone  = step["assembly_zone"]
-
-        in_item = (item_zone is None or
-                   self.zones.point_in_zone(item_zone, hand_center))
-        in_asm  = self.zones.point_in_zone(asm_zone, hand_center)
-
-        self.sim_score = (matcher.cosine_similarity(norm_vector)
-                          if norm_vector is not None else 0.0)
-
-        match_ok = (matcher.has_reference and
-                    self.sim_score >= SIMILARITY_THRESHOLD)
-
-        # ---- transitions ----
-        if self.state == State.IDLE:
-            if item_zone is None and in_asm:
-                self.state = State.IN_ASSEMBLY_ZONE
-            elif in_item:
-                self.state = State.IN_ITEM_ZONE
-
-        elif self.state == State.IN_ITEM_ZONE:
-            if in_asm:
-                self.state = State.IN_ASSEMBLY_ZONE
-
-        elif self.state == State.IN_ASSEMBLY_ZONE:
-            if not in_asm:
-                self.state = State.IDLE
-            elif match_ok:
-                self.state      = State.POSE_MATCH
-                self.hold_count = 1
-
-        elif self.state == State.POSE_MATCH:
-            if not match_ok:
-                self.state      = State.IN_ASSEMBLY_ZONE
-                self.hold_count = 0
+        # Status: picked or not
+        if not all_done:
+            if rt["picked"]:
+                draw_label(display, f"[{step_cfg['name']}] PICKED — go to CHECK zone",
+                           CLR_GREEN, x=14, y=100)
             else:
-                self.hold_count += 1
-                if self.hold_count >= HOLD_FRAMES:
-                    self.state = State.STEP_COMPLETE
+                draw_label(display, f"[{step_cfg['name']}] Go to PICK zone + grip",
+                           CLR_ACCENT, x=14, y=100)
 
-        elif self.state == State.STEP_COMPLETE:
-            self._advance()
+        # FPS
+        now   = time.time()
+        fps   = 0.9 * fps + 0.1 / max(now - prev_t, 1e-6)
+        prev_t = now
+        cv2.putText(display, f"FPS {fps:.1f}", (14, 32),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, CLR_GREEN, 1, cv2.LINE_AA)
 
-    def _advance(self):
-        self.current_step += 1
-        self.hold_count    = 0
-        self.state         = State.IDLE
-        self.sim_score     = 0.0
-        if self.current_step >= len(self.steps):
-            self.all_done     = True
-            self.current_step = len(self.steps) - 1
-            print("[INFO] *** All assembly steps complete! ***")
-        else:
-            print(f"[INFO] Step {self.current_step}: "
-                  f"'{self.steps[self.current_step]['name']}'")
+        cv2.imshow("SOP Assembly", display)
 
-    # ------------------------------------------------------------------
-    # Debug overlay
-    # ------------------------------------------------------------------
+        # ── Hotkeys ───────────────────────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
 
-    _STATE_COLOR = {
-        State.IDLE:             (100, 100, 100),
-        State.IN_ITEM_ZONE:     (30,  200, 255),
-        State.IN_ASSEMBLY_ZONE: (0,   170, 230),
-        State.POSE_MATCH:       (60,  230, 160),
-        State.STEP_COMPLETE:    (60,  200,  80),
-    }
+        if key in (ord("q"), 27):
+            break
 
-    def draw_debug(self, frame: np.ndarray):
-        """Overlay zones, landmarks, state badge, similarity bar, step bar."""
-        h, w = frame.shape[:2]
+        elif key == ord("s"):
+            fname = f"snapshot_step{current_step + 1}_{int(time.time())}.png"
+            cv2.imwrite(fname, frame)
+            print(f"[SNAP] Saved {fname}")
 
-        self.zones.draw_zones(frame)
-        self.pose.draw_landmarks(frame)
+        elif key == ord("r"):
+            runtimes     = [make_step_runtime() for _ in SOP_STEPS]
+            current_step = 0
+            all_done     = False
+            last_sim     = 0.0
+            verifier.reset()
+            print("\n[RESET] Back to Step 1")
 
-        # ---- step progress bar (top) ----
-        BAR_H = 38
-        cv2.rectangle(frame, (0, 0), (w, BAR_H), (18, 18, 18), -1)
-        sw = w // len(self.steps)
-        for i, s in enumerate(self.steps):
-            x0 = i * sw
-            if i < self.current_step or (i == self.current_step and self.all_done):
-                c = (60, 200, 80); lbl = f"v {s['name']}"
-            elif i == self.current_step:
-                c = (0, 200, 255); lbl = f"> {s['name']}"
-            else:
-                c = (70, 70, 70);  lbl = s['name']
-            cv2.rectangle(frame, (x0 + 2, 2), (x0 + sw - 2, BAR_H - 2), c, 1)
-            cv2.putText(frame, lbl, (x0 + 7, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, c, 1, cv2.LINE_AA)
+    cap.release()
+    cv2.destroyAllWindows()
+    hands_model.close()
 
-        # ---- state badge ----
-        sc = self._STATE_COLOR.get(self.state, (160, 160, 160))
-        slabel = ("ALL DONE" if self.all_done
-                  else self.state.name.replace("_", " "))
-        cv2.rectangle(frame, (8, BAR_H + 6), (230, BAR_H + 32), sc, -1)
-        cv2.putText(frame, slabel, (14, BAR_H + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (10, 10, 10), 1, cv2.LINE_AA)
-
-        # ---- similarity bar ----
-        matcher = self.matchers[self.current_step]
-        by = BAR_H + 42
-        if matcher.has_reference:
-            BW = 200
-            filled  = int(BW * max(0.0, self.sim_score))
-            bar_c   = ((60, 230, 160) if self.sim_score >= SIMILARITY_THRESHOLD
-                       else (50, 120, 220))
-            cv2.rectangle(frame, (8, by), (8 + BW, by + 13), (45, 45, 45), -1)
-            cv2.rectangle(frame, (8, by), (8 + filled, by + 13), bar_c, -1)
-            cv2.putText(frame, f"sim {self.sim_score:.3f}", (8 + BW + 6, by + 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, bar_c, 1, cv2.LINE_AA)
-            # hold-frame dots
-            if self.state == State.POSE_MATCH:
-                for d in range(HOLD_FRAMES):
-                    dc = (60, 230, 160) if d < self.hold_count else (55, 55, 55)
-                    cv2.circle(frame, (8 + d * 13 + 6, by + 26), 4, dc, -1)
-        else:
-            cv2.putText(frame, "No reference — press R to capture",
-                        (8, by + 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 150, 255), 1, cv2.LINE_AA)
-
-        # ---- hotkey legend (bottom) ----
-        cv2.putText(frame, "R: capture ref   N: next step   Q: quit",
-                    (10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 140, 140), 1, cv2.LINE_AA)
-
-    # ------------------------------------------------------------------
-    # Optional: post-exit part attachment check (stub)
-    # ------------------------------------------------------------------
-
-    def check_part_still_in_zone(self, frame: np.ndarray, zone_name: str,
-                                  bg_roi: np.ndarray) -> bool:
-        """
-        [OPTIONAL] Detect whether a physical part remains in zone_name after
-        the hand has left, using a stored background ROI.
-
-        Algorithm:
-        1. Capture bg_roi = zone ROI before the step (object present).
-        2. After STEP_COMPLETE + hand leaves zone, capture current ROI.
-        3. Compute mean absolute pixel diff between current and bg_roi.
-        4. If diff < threshold → ROI looks like background → part was taken.
-           If diff ≥ threshold → part still present → flag error.
-
-        Returns True if part appears to have been picked up, False otherwise.
-        Set PART_DIFF_THRESHOLD to ~15–25 depending on lighting conditions.
-        """
-        PART_DIFF_THRESHOLD = 20
-        if zone_name not in self.zones.zones:
-            return True
-        x1, y1, x2, y2 = self.zones.zones[zone_name].bbox
-        roi = frame[y1:y2, x1:x2]
-        if roi.shape != bg_roi.shape:
-            return True   # size mismatch, skip check
-        diff = cv2.absdiff(roi, bg_roi)
-        return float(diff.mean()) < PART_DIFF_THRESHOLD
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
-    def run(self):
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            raise RuntimeError(f"Camera {CAMERA_INDEX} could not be opened.")
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.WIN, 820, 620)
-
-        print("[INFO] Setting up zones ...")
-        self._setup_zones(cap)
-
-        step_name = self.steps[self.current_step]['name']
-        print(f"[INFO] Main loop started.  Step 0: '{step_name}'")
-        print("[INFO] Hold the correct pose and press R to capture a reference.")
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    time.sleep(0.03)
-                    continue
-
-                frame = cv2.flip(frame, 1)
-                rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                # --- Pose ---
-                self.pose.process(rgb)
-                lm_px            = self.pose.get_landmarks_px(frame.shape)
-                self._last_lm_px = lm_px
-                hand_center      = self.pose.get_hand_center_px(frame.shape)
-                norm_vec         = (self.pose.normalize(lm_px)
-                                    if lm_px is not None else None)
-
-                # --- State tick ---
-                self._tick(hand_center, norm_vec)
-
-                # --- Overlay ---
-                self.draw_debug(frame)
-                cv2.imshow(self.WIN, frame)
-
-                # --- Hotkeys ---
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    self.capture_reference()
-                elif key == ord('n'):
-                    print("[DEBUG] Force-advancing step.")
-                    self._advance()
-
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
-            self.pose.close()
-            print("[INFO] Session ended.")
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def _draw_instruction(frame: np.ndarray, text: str):
-    h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, h - 52), (w, h), (18, 18, 18), -1)
-    cv2.putText(frame, text, (12, h - 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2, cv2.LINE_AA)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    monitor = AssemblyMonitor()
-    monitor.run()
+    main()

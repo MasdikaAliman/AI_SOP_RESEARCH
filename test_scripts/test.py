@@ -12,7 +12,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 # ── Landmark groups ───────────────────────────────────────────────────────────
 FINGER_TIPS   = [4, 8, 12, 16, 20]
-FINGER_MCP   = [ 5, 9, 13]
+FINGER_MCP   = [ 6, 10, 14]
 
 
 # ── Colours (BGR) ─────────────────────────────────────────────────────────────
@@ -26,8 +26,8 @@ CLR_GRAY   = (120, 120, 120)
 CLR_PURPLE = (200,  80, 200)
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
-GRIP_THRESHOLD  = 0.25   # normalized dist finger-tip → palm center
-SUCCESS_DELAY   = 1.0    # Jeda waktu (detik) sebelum pindah ke step berikutnya
+GRIP_THRESHOLD  = 0.25
+SUCCESS_DELAY   = 0.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SOP STEP CONFIG
@@ -38,22 +38,40 @@ SOP_STEPS = [
         "step_id"     : 0,
         "name"        : "STEP 1",
         "instruction" : "Ambil item dari area MERAH",
-        "zone_pick"   : (246,  2, 453, 186),
+        # "zone_pick"   : (457, 262, 574, 406),
+        "zone_pick"   : (58, 257,150, 446),
         "clr_pick"    : CLR_RED,
     },
     {
         "step_id"     : 1,
         "name"        : "STEP 2",
         "instruction" : "Ambil item dari area ORANGE",
-        "zone_pick"   : (365, 162, 494, 356),
+        # "zone_pick"   : (365, 256, 460, 410),
+        "zone_pick"   : (181, 271,254, 442),
         "clr_pick"    : CLR_ORANGE,
     },
     {
         "step_id"     : 2,
         "name"        : "STEP 3",
         "instruction" : "Ambil item dari area UNGU",
-        "zone_pick"   : (149, 163,298, 368),
+        "zone_pick"   : (272, 260,357, 426),
         "clr_pick"    : CLR_PURPLE,
+    },
+    {
+        "step_id": 3,
+        "name": "STEP 4",
+        "instruction": "Ambil item dari area UNGU",
+        # "zone_pick": (181, 271,254, 442),
+        "zone_pick": (365, 256, 460, 410),
+        "clr_pick": CLR_PURPLE,
+    },
+    {
+        "step_id": 4,
+        "name": "STEP 4",
+        "instruction": "Ambil item dari area UNGU",
+        # "zone_pick": (58, 257,150, 446),
+        "zone_pick": (457, 262, 574, 406),
+        "clr_pick": CLR_PURPLE,
     },
 ]
 
@@ -145,6 +163,11 @@ def make_step_runtime():
         "picked_time": None # Untuk tracking jeda transisi
     }
 
+def mouse_callback(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        print(f"Mouse Clicked at: ({x}, {y})")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -162,7 +185,8 @@ def main():
     lm_style   = mp_drawing.DrawingSpec(color=CLR_GREEN,  thickness=4, circle_radius=4)
 
     # ── Camera ────────────────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    # cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap =  cv2.VideoCapture("../data/capture/data3.mp4")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
@@ -178,13 +202,18 @@ def main():
     print("\nHotkeys: Q/ESC = quit   S = snapshot   R = reset")
     print(f"Starting at {SOP_STEPS[0]['name']}: {SOP_STEPS[0]['instruction']}\n")
 
+    cv2.namedWindow("SOP Assembly")
+    cv2.setMouseCallback("SOP Assembly", mouse_callback)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
 
-        frame        = cv2.flip(frame, 1)
-        display      = frame.copy()
+        # frame        = cv2.flip(frame, 1)
+        # display      = frame.copy()
+        display      = cv2.resize(frame, (640, 480))
         h, w         = display.shape[:2]
+        # print(h, w)
         rgb          = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_result    = hands_model.process(rgb)
 
@@ -205,15 +234,21 @@ def main():
         hand_in_pick  = False
         grip_detected = False
 
-        if mp_result.multi_hand_landmarks and not all_done:
-            for lms in mp_result.multi_hand_landmarks:
+        if mp_result.multi_hand_landmarks and mp_result.multi_handedness and not all_done:
+            # if mp_result.multi_handedness.classification[0].label == ""
+            for lms, handedness in zip( mp_result.multi_hand_landmarks, mp_result.multi_handedness):
                 mp_drawing.draw_landmarks(display, lms, mp_hands.HAND_CONNECTIONS, lm_style, conn_style)
+
+                label = handedness.classification[0].label
+                if label == "Left":
+                    continue
+
 
                 tips = fingertip_pixels(lms, w, h)
                 mcps = fingermcp_pixels(lms, w, h)
-                for cx, cy in tips:
-                    cv2.circle(display, (cx, cy), 9, CLR_YELLOW, -1)
-                    cv2.circle(display, (cx, cy), 9, CLR_WHITE,  2)
+                # for cx, cy in tips:
+                #     cv2.circle(display, (cx, cy), 9, CLR_YELLOW, -1)
+                #     cv2.circle(display, (cx, cy), 9, CLR_WHITE,  2)
 
                 if any_tip_in_zone(mcps, step_cfg["zone_pick"]):
                     hand_in_pick = True
@@ -287,6 +322,10 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27): break
         elif key == ord("s"): cv2.imwrite(f"snap_{int(time.time())}.png", frame)
+        elif key == ord("p"):
+            print("Pause")
+            cv2.waitKey(0)
+
         elif key == ord("r"):
             runtimes     = [make_step_runtime() for _ in SOP_STEPS]
             current_step = 0

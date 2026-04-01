@@ -190,7 +190,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
-
+    # (11, 219), (611, 231)
     # ── Runtime per step ──────────────────────────────────────────────────────
     runtimes     = [make_step_runtime() for _ in SOP_STEPS]
     current_step = 0

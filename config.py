@@ -6,6 +6,8 @@ All other modules import from here; nothing reads the YAML directly.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
+
 import yaml
 
 
@@ -55,21 +57,52 @@ class ColorsConfig:
 
 
 @dataclass
+class DinoConfig:
+    model_name : str = "dinov2_vitb14"
+    pass_threshold: float = 0.7
+
+
+@dataclass
+class InspectConfig:
+    crop_coords : tuple
+    reference_folder : Path
+    pass_threshold:  Optional[float]
+
+@dataclass
 class SOPStep:
     step_id:     int
     name:        str
     instruction: str
     zone_pick:   tuple        # (x1, y1, x2, y2)
     clr_pick:    tuple        # BGR color tuple
+    mode : str = "hand_only"
+    inspect_config: Optional[InspectConfig] = None
+
+    def __post_init__(self):
+        if self.mode == "inspect" and self.inspect_config is None:
+            raise ValueError(
+                f"Step '{self.name}' (step_id={self.step_id}) has mode='inspect' "
+                f"but no 'inspect' block defined in config.yaml."
+            )
+        if self.mode not in ("hand_only", "inspect"):
+            raise ValueError(
+                f"Step '{self.name}' has unknown mode '{self.mode}'. "
+                f"Valid values: 'hand_only', 'inspect'."
+            )
+
+    @property
+    def needs_inspect(self) -> bool:
+        return self.mode == "inspect"
 
 
 @dataclass
 class AppConfig:
-    camera:    CameraConfig
+    camera: CameraConfig
     mediapipe: MediaPipeConfig
-    gesture:   GestureConfig
-    colors:    ColorsConfig
-    assembly_zone: tuple      # (x1, y1, x2, y2)
+    gesture: GestureConfig
+    colors: ColorsConfig
+    dino: DinoConfig
+    assembly_zone: tuple  # (x1, y1, x2, y2)
     sop_steps: list[SOPStep]
 
     # Derived — built once for O(1) wrong-zone lookups
@@ -77,6 +110,11 @@ class AppConfig:
 
     def __post_init__(self):
         self.pick_zones = {s.step_id: s.zone_pick for s in self.sop_steps}
+
+    @property
+    def has_inspect_steps(self) -> bool:
+        """True if any step requires DINOv2 inspection — used to lazy-load model."""
+        return any(s.needs_inspect for s in self.sop_steps)
 
 
 # ── Loader ─────────────────────────────────────────────────────────────────────
@@ -127,6 +165,13 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         pick_dwell_time= float(g_raw["pick_dwell_time"])
     )
 
+    dino_raw = raw["dino_model"]
+    dino_cfg = DinoConfig(
+        model_name=dino_raw.get("model_name"),
+        pass_threshold= float(dino_raw["pass_threshold"])
+    )
+
+
     assembly_zone = tuple(raw["zones"]["assembly"])
 
     # Parse SOP steps — validate step_id uniqueness
@@ -137,13 +182,47 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         if sid in seen_ids:
             raise ValueError(f"Duplicate step_id {sid} in sop_steps[{i}]")
         seen_ids.add(sid)
+        mode = str(s.get("mode", "hand_only"))
+
+        inspect_cfg: Optional[InspectConfig] = None
+
+        if "inspect_config" in s:
+            raw_inspect = s["inspect_config"]
+            ref_folder = Path(raw_inspect["reference_folder"])
+            if not ref_folder.exists():
+                import warnings
+                warnings.warn(
+                    f"Step '{s['name']}': reference_folder not found: "
+                    f"{ref_folder.resolve()} — creating it now.",
+                    UserWarning,
+                )
+                ref_folder.mkdir(parents=True, exist_ok=True)
+
+            raw_crop = raw_inspect["crop_coords"]
+            if len(raw_crop) != 4:
+                raise ValueError(
+                    f"Step '{s['name']}': crop_coords must have 4 values "
+                    f"[y1, y2, x1, x2], got {raw_crop}"
+                )
+
+            inspect_cfg = InspectConfig(
+                crop_coords=tuple(int(v) for v in raw_crop),
+                reference_folder=ref_folder,
+                pass_threshold=(
+                    float(raw_inspect["pass_threshold"])
+                    if "pass_threshold" in raw_inspect
+                    else None
+                ),
+            )
 
         sop_steps.append(SOPStep(
-            step_id     = sid,
-            name        = str(s["name"]),
-            instruction = str(s["instruction"]),
-            zone_pick   = tuple(s["zone_pick"]),
-            clr_pick    = colors.by_name(s["clr_pick"]),
+            step_id=sid,
+            name=str(s["name"]),
+            instruction=str(s["instruction"]),
+            zone_pick=tuple(s["zone_pick"]),
+            clr_pick=colors.by_name(s["clr_pick"]),
+            mode=mode,
+            inspect_config=inspect_cfg,
         ))
 
     # Sort by step_id to guarantee execution order
@@ -154,6 +233,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         mediapipe     = mediapipe,
         gesture       = gesture,
         colors        = colors,
+        dino=dino_cfg,
         assembly_zone = assembly_zone,
         sop_steps     = sop_steps,
     )

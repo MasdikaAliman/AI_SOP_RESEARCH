@@ -1,9 +1,9 @@
-"""
-sop_engine.py — SOP state machine.
-Knows nothing about drawing or camera; only advances state based on HandState.
-"""
 
 from __future__ import annotations
+
+from typing import Optional
+
+import hand_tracker
 from dataclasses import dataclass, field
 import time
 
@@ -11,18 +11,25 @@ import icecream
 
 from config import AppConfig, SOPStep
 from hand_tracker import HandState
-
-
+from hand_tracker  import _centroid_in_zone
+from SOPVerifier import SOPVerifier
+_INSPECT_COOLDOWN = 0.2
+from FeatureBasedVerifier import FeatureBasedVerifier
 # ── Per-step runtime state ─────────────────────────────────────────────────────
 
 @dataclass
 class StepRuntime:
-    picked:      bool  = False
-    picked_time: float = 0.0
-    at_assembly: bool  = False
-    grip_start: float = 0.0
+    picked:              bool  = False
+    picked_time:         float = 0.0
+    at_assembly:         bool  = False
+    grip_start:          float = 0.0
+    # Inspect-specific
+    inspect_passed:      bool  = False   # True once DINOv2 confirms the pick
+    inspect_result:      Optional[dict] = None   # last raw verifier result
+    inspect_last_run:    float = 0.0     # timestamp of last DINOv2 call (throttle)
 
-# ── Flash message (returned to Renderer, keeps engine drawing-free) ────────────
+
+
 
 @dataclass
 class FlashMessage:
@@ -33,21 +40,20 @@ class FlashMessage:
 # ── SOPEngine ──────────────────────────────────────────────────────────────────
 
 class SOPEngine:
-    """
-    Drives the SOP workflow.
-    Call update(hand_state) every frame → may advance current_step or set all_done.
-    """
 
-    def __init__(self, cfg: AppConfig):
+
+    def __init__(self, cfg: AppConfig, verifiers: Optional[dict[int, "SOPVerifier"]] = None,
+                 feature_verifiers: Optional[dict[int, "FeatureBasedVerifier"]] = None
+                 ):
         self._cfg          = cfg
         self._steps        = cfg.sop_steps
+        # self._verifiers: dict[int, "SOPVerifier"] = verifiers or {}
+        self._verifiers: dict[int, "FeatureBasedVerifier"] = feature_verifiers or {} # Add feature verifier dict
         self._runtimes: list[StepRuntime] = [StepRuntime() for _ in self._steps]
         self.current_step  = 0
         self.all_done      = False
-        self._session_start: float = 0.0   # set on first grip-in-zone
-        self._session_end:   float = 0.0   # set when all_done
-
-    # ── Public API ─────────────────────────────────────────────────────────────
+        self._start_time:    float = 0.0
+        self._elapsed_total: float = 0.0
 
     @property
     def step_cfg(self) -> SOPStep:
@@ -57,50 +63,49 @@ class SOPEngine:
     def runtime(self) -> StepRuntime:
         return self._runtimes[self.current_step]
 
-    def update(self, hand: HandState) -> FlashMessage | None:
-        """
-        Advance state based on hand.
-        Returns a FlashMessage to display, or None if nothing to flash.
-        """
-        if self.current_step == 0:
-            self.start_time_sop = time.time()
+    def update(self, hand: HandState, current, frame=None) -> FlashMessage | None:
+
         if self.all_done:
             self.reset()
-            elapsed_all_step = time.time() - self.start_time_sop
-            print(f"Total Time: {elapsed_all_step}")
             return None
 
-        rt = self.runtime
+        # rt = self._runtimes[current]
+        rt = self._runtimes[self.current_step]
+        # self.current_step = current
+        # icecream.ic(current)
         # icecream.ic(self._runtimes)
         # icecream.ic(rt.picked, rt.at_assembly)
         if not rt.picked:
             return self._handle_pre_pick(rt, hand)
         else:
-            return self._handle_post_pick(rt, hand)
+            return self._handle_post_pick(rt, hand, frame)
 
     def reset(self):
         self._runtimes  = [StepRuntime() for _ in self._steps]
         self.current_step = 0
         self.all_done     = False
+        # for v in self._verifiers.values():
+        #     v.reset()
         print("\n[RESET] Back to Step 1")
 
     # ── Private ────────────────────────────────────────────────────────────────
 
     def _handle_pre_pick(self, rt: StepRuntime, hand: HandState) -> FlashMessage | None:
-        if rt.grip_start == 0.0:
-            rt.grip_start = time.time()
+
 
         if hand.in_wrong_zone:
-            print("WARNING ZONE")
-            if self.current_step > 0:
-                self.current_step -= 1
-                self._runtimes[self.current_step].picked = False
-                self._runtimes[self.current_step].at_assembly = False
+            rt.grip_start = 0.0
             return FlashMessage(False, "WARNING: Wrong zone! Go to correct pick area.")
 
         if hand.in_pick and hand.grip:
-            # Start the dwell timer on first frame of grip-in-zone
-            elapsed = time.time() - rt.grip_start
+            now = time.time()
+            if self._start_time == 0.0:
+                self._start_time = now
+
+            if rt.grip_start == 0.0:
+                rt.grip_start = now
+
+            elapsed = now - rt.grip_start
             # Show progress so user knows to hold
             icecream.ic(elapsed)
             if elapsed < self._cfg.gesture.pick_dwell_time:
@@ -110,7 +115,7 @@ class SOPEngine:
 
             # Dwell satisfied → confirm pick
             rt.picked = True
-            rt.picked_time = time.time()
+            rt.picked_time = now
             print(f"[PICK] {self.step_cfg.name} — item picked!")
 
         else:
@@ -119,18 +124,98 @@ class SOPEngine:
 
         return None
 
-    def _handle_post_pick(self, rt: StepRuntime, hand: HandState) -> FlashMessage | None:
+    def _handle_post_pick(self, rt: StepRuntime, hand: HandState,
+                          frame) -> FlashMessage | None:
+        """
+        After pick is confirmed:
+          • hand_only : wait for assembly zone → advance
+          • inspect   : run DINOv2 first, then wait for assembly zone → advance
+        """
+        step = self.step_cfg
+
+        # ── Inspect gate (runs once until it passes) ───────────────────────
+        if step.needs_inspect and not rt.inspect_passed and hand.in_assembly:
+            return self._handle_inspect(rt, frame)
+
+        # ── Assembly phase (same for both modes after inspect clears) ──────
         if hand.in_assembly:
             rt.at_assembly = True
 
         if rt.at_assembly:
             elapsed = time.time() - rt.picked_time
-            # icecream.ic(elapsed)
             if elapsed > self._cfg.gesture.success_delay:
                 self._advance()
-            return FlashMessage(True, f"{self.step_cfg.name} SUCCESS!")
+            return FlashMessage(True, f"{step.name} SUCCESS!")
 
-        return FlashMessage(False, f"{self.step_cfg.name} — Bring to ASSEMBLY ZONE!")
+        return FlashMessage(False, f"{step.name} — Bring to ASSEMBLY ZONE!")
+
+    def _handle_inspect(self, rt: StepRuntime, frame) -> FlashMessage | None:
+        """
+        Crop the current frame and run the DINOv2 verifier.
+        Throttled by _INSPECT_COOLDOWN so we don't hammer CPU every frame.
+        """
+        step = self.step_cfg
+
+        if frame is None:
+            print(f"[WARN] Step {step.name} is inspect mode but no frame was passed "
+                  f"to engine.update(). Skipping DINOv2 check.")
+            rt.inspect_passed = True
+            return None
+
+        verifier = self._verifiers.get(step.step_id)
+        if verifier is None:
+            print(f"[WARN] No verifier registered for step_id={step.step_id}. "
+                  f"Skipping DINOv2 check.")
+            rt.inspect_passed = True
+            return None
+
+        # Throttle: only run inference every _INSPECT_COOLDOWN seconds
+        now = time.time()
+        if now - rt.inspect_last_run < _INSPECT_COOLDOWN:
+            # Return the last known result message while waiting
+            if rt.inspect_result is None:
+                return FlashMessage(None, f"[{step.name}] Analysing item...")
+            sim = rt.inspect_result["similarity"]
+            # thr = verifier.threshold
+            thr = verifier.match_ratio_threshold
+            return FlashMessage(False, f"[INSPECT] sim={sim:.2f} / need {thr:.2f} — retrying...")
+
+        rt.inspect_last_run = now
+
+        # Crop the frame according to inspect config
+        ins = step.inspect_config
+        y1, y2, x1, x2 = ins.crop_coords
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            print(f"[WARN] Crop region is empty for step {step.name}. "
+                  f"Check crop_coords in config.yaml.")
+            rt.inspect_passed = True
+            return None
+
+        # Run verifier
+        # result = verifier.verify(crop)
+        result = verifier.verify(crop, expected_step_id=self.current_step)
+        rt.inspect_result = result
+
+        sim = result["similarity"]
+        passed = result["passed"]
+
+        if passed:
+            rt.inspect_passed = True
+            rt.picked_time = now  # reset so assembly phase timer is fresh
+            print(f"[INSPECT] {step.name} | sim={sim:.3f} | passed={passed}")
+            return FlashMessage(True, f"[INSPECT PASS] {step.name} — sim={sim:.2f}")
+        else:
+            # best = result.get("best_match_name", "?")
+            # # best_sim = result.get("best_match_sim", 0.0)
+            # # if (result.get("best_match_step") != verifier.
+            # #         and best_sim >= verifier.pass_threshold):
+            # #     msg = f"[INSPECT] Wrong item! Detected '{best}', expected '{name}'"
+            # # else:
+            msg = (f"[INSPECT] Not recognised — "
+                       f"sim={sim:.2f} (need {verifier.pass_threshold:.2f})")
+            return FlashMessage(False, msg)
 
     def _advance(self):
         if self.current_step < len(self._steps) - 1:

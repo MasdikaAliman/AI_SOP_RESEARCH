@@ -7,7 +7,7 @@ import numpy as np
 
 class DINOv2Encoder:
     def __init__(self, model_name='dinov2_vitb14', device=None):
-        self.device = device or ('cpu' if torch.cuda.is_available() else 'cpu')
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         # Load DINOv2 from torch hub — no training needed
         self.model = torch.hub.load('facebookresearch/dinov2', model_name)
         self.model.eval().to(self.device)

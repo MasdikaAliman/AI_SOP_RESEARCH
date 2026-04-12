@@ -1,23 +1,23 @@
 camera:
-  source: "data/capture/data5.mp4"   # int (0, 1...) for webcam, or file path
+  source: "data/capture/data4.mp4"   # int (0, 1...) for webcam, or file path
   frame_w: 640
   frame_h: 480
-  fps: 1
-
+  fps: 30
+ 
 mediapipe:
   max_hands: 2
   detection_confidence: 0.55
   tracking_confidence: 0.50
   model_complexity: 1
-
+ 
 gesture:
   grip_threshold: 0.25    # lower = tighter grip required
-  success_delay: 0.0      # seconds hand must stay at assembly zone before advancing
+  success_delay: 0.1      # seconds hand must stay at assembly zone before advancing
   pick_dwell_time: 0.0
-
+ 
 zones:
   assembly: [138, 48, 536, 248]   # [x1, y1, x2, y2] — static, does not change per step
-
+ 
 colors:
   white:  [240, 240, 240]
   green:  [50,  220,  90]
@@ -27,18 +27,42 @@ colors:
   orange: [0,   140, 255]
   gray:   [120, 120, 120]
   purple: [200,  80, 200]
-
-dino_model:
-#  model_name: "dinov2_vitl14"
-  model_name: "dinov2_vitb14"
-  pass_threshold: 0.75
-
-
+ 
+# -- Visual Inspection encoder settings --------------------------------------
+# encoder: which matching algorithm to use
+#   'xfeat'       - fast, CPU real-time, brute-force matcher  (no extra install)
+#   'lightglue'   - accurate, neural matcher, slower on CPU   (needs: pip install -e LightGlue/)
+#
+# lightglue_features: backend extractor for LightGlue
+#   'aliked'      - best for industrial / low-texture items  (RECOMMENDED)
+#   'superpoint'  - general purpose, restrictive license
+#   'disk'        - good for outdoor/complex scenes
+#   'sift'        - classical, no GPU needed, slowest
+inspect:
+  encoder: xfeat               # switch to lightglue to test
+  pass_threshold: 30           # min inlier count to PASS (tune 10-50)
+  max_num_keypoints: 2048      # max keypoints per image (XFeat top_k / LightGlue max_num_keypoints)
+  max_expected_inliers: 30     # inlier count that = similarity 1.0 (tune per item size)
+  # XFeat only:
+  detection_threshold: 0.1   # XFeat keypoint confidence cutoff
+  # LightGlue only:
+  lightglue_features: aliked   # aliked | superpoint | disk | sift
+  depth_confidence: 0.9      # LightGlue early stopping (lower=faster, -1=off)
+  width_confidence: 0.9       # LightGlue point pruning  (lower=faster, -1=off)
+  filter_threshold: 0.1        # LightGlue match confidence cutoff (higher=fewer,stronger)
+ 
 
 # ── SOP Steps ─────────────────────────────────────────────────────────────────
-# zone_pick: [x1, y1, x2, y2]
-# clr_pick:  one of the color names defined above
-
+# zone_pick    : [x1, y1, x2, y2]
+# clr_pick     : one of the color names defined above
+# mode         : "hand_only"  → advance purely on hand-tracker logic
+#                "inspect"    → hand-tracker picks, then DINOv2 verifies crop
+#
+# inspect block (required only when mode: inspect):
+#   crop_coords     : [y1, y2, x1, x2]  region of resized frame to feed DINOv2
+#   reference_folder: path to folder of reference images for this step
+#                     (sorted filenames = sub-step order; single image is fine)
+#   pass_threshold  : override global dino.pass_threshold for this step (optional)
 sop_steps:
   - step_id: 0
     name: "STEP 1"
@@ -47,10 +71,10 @@ sop_steps:
     clr_pick: red
 #    mode: hand_only
     mode: inspect
-    inspect_config:
+    inspect:
       crop_coords: [ 73, 228, 160, 300 ]      # [y1, y2, x1, x2] on resized 640x480 frame
       reference_folder: "data/capture/SOP_IMAGE/STEP1"
-      pass_threshold: 0.6
+      pass_threshold: 0.5
 
   - step_id: 1
     name: "STEP 2"
@@ -81,7 +105,7 @@ sop_steps:
     clr_pick: purple
 #    mode: hand_only
     mode: inspect
-    inspect_config:
+    inspect:
       crop_coords: [ 5, 151, 180, 420]      # [y1, y2, x1, x2] on resized 640x480 frame
       reference_folder: "data/capture/SOP_IMAGE/STEP5"
-      pass_threshold: 0.6
+      pass_threshold: 0.5

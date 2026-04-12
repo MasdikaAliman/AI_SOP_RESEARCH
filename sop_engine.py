@@ -13,7 +13,7 @@ from config import AppConfig, SOPStep
 from hand_tracker import HandState
 from hand_tracker  import _centroid_in_zone
 from SOPVerifier import SOPVerifier
-_INSPECT_COOLDOWN = 0.2
+_INSPECT_COOLDOWN = 0.5
 from FeatureBasedVerifier import FeatureBasedVerifier
 # ── Per-step runtime state ─────────────────────────────────────────────────────
 
@@ -47,8 +47,8 @@ class SOPEngine:
                  ):
         self._cfg          = cfg
         self._steps        = cfg.sop_steps
-        # self._verifiers: dict[int, "SOPVerifier"] = verifiers or {}
-        self._verifiers: dict[int, "FeatureBasedVerifier"] = feature_verifiers or {} # Add feature verifier dict
+        self._verifiers: dict[int, "SOPVerifier"] = verifiers or {}
+        # self._verifiers: dict[int, "FeatureBasedVerifier"] = feature_verifiers or {} # Add feature verifier dict
         self._runtimes: list[StepRuntime] = [StepRuntime() for _ in self._steps]
         self.current_step  = 0
         self.all_done      = False
@@ -63,7 +63,7 @@ class SOPEngine:
     def runtime(self) -> StepRuntime:
         return self._runtimes[self.current_step]
 
-    def update(self, hand: HandState, current, frame=None) -> FlashMessage | None:
+    def update(self, hand: HandState, frame=None) -> FlashMessage | None:
 
         if self.all_done:
             self.reset()
@@ -84,8 +84,8 @@ class SOPEngine:
         self._runtimes  = [StepRuntime() for _ in self._steps]
         self.current_step = 0
         self.all_done     = False
-        # for v in self._verifiers.values():
-        #     v.reset()
+        for v in self._verifiers.values():
+            v.reset()
         print("\n[RESET] Back to Step 1")
 
     # ── Private ────────────────────────────────────────────────────────────────
@@ -176,14 +176,14 @@ class SOPEngine:
             if rt.inspect_result is None:
                 return FlashMessage(None, f"[{step.name}] Analysing item...")
             sim = rt.inspect_result["similarity"]
-            # thr = verifier.threshold
-            thr = verifier.match_ratio_threshold
+            thr = verifier.threshold
+            # thr = verifier.match_ratio_threshold
             return FlashMessage(False, f"[INSPECT] sim={sim:.2f} / need {thr:.2f} — retrying...")
 
         rt.inspect_last_run = now
 
         # Crop the frame according to inspect config
-        ins = step.inspect_config
+        ins = step.inspect
         y1, y2, x1, x2 = ins.crop_coords
         crop = frame[y1:y2, x1:x2]
 
@@ -194,8 +194,8 @@ class SOPEngine:
             return None
 
         # Run verifier
-        # result = verifier.verify(crop)
-        result = verifier.verify(crop, expected_step_id=self.current_step)
+        result = verifier.verify(crop)
+        # result = verifier.verify(crop, expected_step_id=self.current_step)
         rt.inspect_result = result
 
         sim = result["similarity"]
@@ -213,8 +213,10 @@ class SOPEngine:
             # #         and best_sim >= verifier.pass_threshold):
             # #     msg = f"[INSPECT] Wrong item! Detected '{best}', expected '{name}'"
             # # else:
+            # msg = (f"[INSPECT] Not recognised — "
+            #            f"sim={sim:.2f} (need {verifier.pass_threshold:.2f})")
             msg = (f"[INSPECT] Not recognised — "
-                       f"sim={sim:.2f} (need {verifier.pass_threshold:.2f})")
+                       f"sim={sim:.2f} (need {verifier.threshold:.2f})")
             return FlashMessage(False, msg)
 
     def _advance(self):

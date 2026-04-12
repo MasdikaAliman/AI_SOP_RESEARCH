@@ -193,76 +193,76 @@ class FeatureBasedVerifier:
         else:
             print(f"[ERROR] Cannot save empty features for step {step_id}")
 
-    def verify(self, frame: np.ndarray, expected_step_id: int) -> dict:
-        """
-        Main verification function.
-        Args:
-            frame: The live camera frame (BGR).
-            expected_step_id: The step ID for which the item is expected.
-        Returns:
-            A dictionary containing the verification result.
-        """
-        if expected_step_id not in self.ref_features:
-            print(f"[ERROR] No reference features loaded for step_id {expected_step_id}")
-            return {
-                'expected_step': expected_step_id,
-                'passed': False,
-                'message': f"No reference data for step {expected_step_id}",
-                'similarity': 0.0  # Using 'similarity' key for consistency, though meaning differs
-            }
+    # def verify(self, frame: np.ndarray, expected_step_id: int) -> dict:
+    #     """
+    #     Main verification function.
+    #     Args:
+    #         frame: The live camera frame (BGR).
+    #         expected_step_id: The step ID for which the item is expected.
+    #     Returns:
+    #         A dictionary containing the verification result.
+    #     """
+    #     if expected_step_id not in self.ref_features:
+    #         print(f"[ERROR] No reference features loaded for step_id {expected_step_id}")
+    #         return {
+    #             'expected_step': expected_step_id,
+    #             'passed': False,
+    #             'message': f"No reference data for step {expected_step_id}",
+    #             'similarity': 0.0  # Using 'similarity' key for consistency, though meaning differs
+    #         }
 
-        ref_desc = self.ref_features[expected_step_id]['desc_array']
+    #     ref_desc = self.ref_features[expected_step_id]['desc_array']
 
-        # --- Feature Matching ---
-        # Convert frame to grayscale
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Detect and compute features on the live frame
-        live_kp, live_desc = self.detector.detectAndCompute(gray_frame, None)
+    #     # --- Feature Matching ---
+    #     # Convert frame to grayscale
+    #     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    #     # Detect and compute features on the live frame
+    #     live_kp, live_desc = self.detector.detectAndCompute(gray_frame, None)
 
-        if live_desc is None or live_desc.size == 0 or ref_desc.size == 0:
-            # print(f"[DEBUG] No descriptors found in live frame or reference for step {expected_step_id}") # Uncomment for debugging
-            return {
-                'expected_step': expected_step_id,
-                'passed': False,
-                'message': "No features detected in live frame or reference",
-                'similarity': 0.0
-            }
+    #     if live_desc is None or live_desc.size == 0 or ref_desc.size == 0:
+    #         # print(f"[DEBUG] No descriptors found in live frame or reference for step {expected_step_id}") # Uncomment for debugging
+    #         return {
+    #             'expected_step': expected_step_id,
+    #             'passed': False,
+    #             'message': "No features detected in live frame or reference",
+    #             'similarity': 0.0
+    #         }
 
-        # Match features
-        matches = self.matcher.knnMatch(live_desc, ref_desc, k=2)  # Get top 2 matches for each live descriptor
+    #     # Match features
+    #     matches = self.matcher.knnMatch(live_desc, ref_desc, k=2)  # Get top 2 matches for each live descriptor
 
-        # Apply Lowe's ratio test to filter good matches
-        good_matches = []
-        if matches:
-            for m_n in matches:
-                if len(m_n) == 2:  # Ensure both matches exist
-                    m, n = m_n
-                    if m.distance < self.match_ratio_threshold * n.distance:
-                        good_matches.append(m)
+    #     # Apply Lowe's ratio test to filter good matches
+    #     good_matches = []
+    #     if matches:
+    #         for m_n in matches:
+    #             if len(m_n) == 2:  # Ensure both matches exist
+    #                 m, n = m_n
+    #                 if m.distance < self.match_ratio_threshold * n.distance:
+    #                     good_matches.append(m)
 
-        num_good_matches = len(good_matches)
+    #     num_good_matches = len(good_matches)
 
-        total_ref_features = len(self.ref_features[expected_step_id]['kp_list'])
+    #     total_ref_features = len(self.ref_features[expected_step_id]['kp_list'])
 
-        # Calculate a "similarity" score based on good matches
-        # This is a heuristic and might need adjustment
-        good_matches_ratio = num_good_matches / max(total_ref_features, 1)  # Avoid division by zero
-        similarity_score = good_matches_ratio  # Or calculate differently if needed
+    #     # Calculate a "similarity" score based on good matches
+    #     # This is a heuristic and might need adjustment
+    #     good_matches_ratio = num_good_matches / max(total_ref_features, 1)  # Avoid division by zero
+    #     similarity_score = good_matches_ratio  # Or calculate differently if needed
 
-        # Determine pass/fail
-        required_matches = int(self.pass_threshold * self.min_matches_needed)
-        passed = num_good_matches >= required_matches  # Or use good_matches_ratio >= self.pass_threshold
-        icecream.ic(num_good_matches, total_ref_features, required_matches)
-        result = {
-            'expected_step': expected_step_id,
-            'passed': passed,
-            'similarity': round(similarity_score, 4),  # Consistent key name
-            'message': f"Found {num_good_matches}/{required_matches} required matches" if passed else f"Only {num_good_matches}/{required_matches} matches found"
-        }
+    #     # Determine pass/fail
+    #     required_matches = int(self.pass_threshold * self.min_matches_needed)
+    #     passed = num_good_matches >= required_matches  # Or use good_matches_ratio >= self.pass_threshold
+    #     icecream.ic(num_good_matches, total_ref_features, required_matches)
+    #     result = {
+    #         'expected_step': expected_step_id,
+    #         'passed': passed,
+    #         'similarity': round(similarity_score, 4),  # Consistent key name
+    #         'message': f"Found {num_good_matches}/{required_matches} required matches" if passed else f"Only {num_good_matches}/{required_matches} matches found"
+    #     }
 
-        # Optional: Print debug info
-        # print(f"[DEBUG] Step {expected_step_id}: Matches: {num_good_matches}, Ratio: {good_matches_ratio:.2f}, Passed: {passed}")
+    #     # Optional: Print debug info
+    #     # print(f"[DEBUG] Step {expected_step_id}: Matches: {num_good_matches}, Ratio: {good_matches_ratio:.2f}, Passed: {passed}")
 
-        return result
+    #     return result
 
 

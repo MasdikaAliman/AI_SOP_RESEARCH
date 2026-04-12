@@ -74,7 +74,7 @@ class Renderer:
         if not step.needs_inspect:
             return
 
-        ins = step.inspect_config
+        ins = step.inspect
         cy1, cy2, cx1, cx2 = ins.crop_coords   # config format: y1,y2,x1,x2
         cfg = self._cfg
 

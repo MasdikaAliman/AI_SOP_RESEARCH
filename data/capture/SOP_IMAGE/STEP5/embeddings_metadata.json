@@ -1,0 +1,10 @@
+{
+  "mode": "dino",
+  "steps": [
+    {
+      "step_id": 0,
+      "step_name": "STEP_5",
+      "num_refs": 4
+    }
+  ]
+}
